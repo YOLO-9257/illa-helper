@@ -79,10 +79,8 @@
               <!-- 启用开关 -->
               <Switch
                 :key="`switch-${config.id}-${String(config.enabled)}`"
-                :checked="
-                  config.enabled === undefined || config.enabled === true
-                "
-                @update:checked="
+                :model-value="config.enabled !== false"
+                @update:model-value="
                   (val: boolean) => $emit('toggle', config.id, val)
                 "
                 class="scale-90"
