@@ -5,7 +5,7 @@
 
 import { ApiServiceFactory } from '../../api';
 import { StyleManager } from '../../styles';
-import { StorageService } from '../storage';
+import { StorageService, StorageEventType } from '../storage';
 
 // 替换结果接口
 export interface ReplacementResult {
@@ -61,6 +61,9 @@ export class TextReplacerService {
   private config: ReplacementConfig;
   private cache: Map<string, FullTextAnalysisResponse>;
 
+  // 用户设置缓存，避免频繁读取存储
+  private settingsCache: UserSettings | null;
+
   /**
    * 私有构造函数，确保单例模式
    */
@@ -68,7 +71,9 @@ export class TextReplacerService {
     this.config = config;
     this.styleManager = new StyleManager();
     this.cache = new Map<string, FullTextAnalysisResponse>();
+    this.settingsCache = null;
     this.initializeStyleManager();
+    this.setupSettingsCacheInvalidation();
   }
 
   /**
@@ -101,6 +106,47 @@ export class TextReplacerService {
   }
 
   /**
+   * 设置用户设置缓存失效监听
+   */
+  private setupSettingsCacheInvalidation(): void {
+    const storageService = StorageService.getInstance();
+
+    const invalidateCache = () => {
+      this.settingsCache = null;
+    };
+
+    storageService.addEventListener(
+      StorageEventType.SETTINGS_SAVED,
+      invalidateCache,
+    );
+    storageService.addEventListener(
+      StorageEventType.SETTINGS_LOADED,
+      invalidateCache,
+    );
+    storageService.addEventListener(
+      StorageEventType.API_CONFIG_UPDATED,
+      invalidateCache,
+    );
+    storageService.addEventListener(
+      StorageEventType.DATA_CLEARED,
+      invalidateCache,
+    );
+  }
+
+  /**
+   * 获取用户设置（带缓存）
+   */
+  private async getCachedSettings(): Promise<UserSettings> {
+    if (this.settingsCache) {
+      return this.settingsCache;
+    }
+
+    const storageService = StorageService.getInstance();
+    this.settingsCache = await storageService.getUserSettings();
+    return this.settingsCache;
+  }
+
+  /**
    * 更新服务配置
    * @param config 新的配置（部分更新）
    */
@@ -126,9 +172,8 @@ export class TextReplacerService {
    */
   public async replaceText(text: string): Promise<FullTextAnalysisResponse> {
     try {
-      // 获取当前用户设置
-      const storageService = StorageService.getInstance();
-      const settings = await storageService.getUserSettings();
+      // 获取当前用户设置（使用缓存）
+      const settings = await this.getCachedSettings();
 
       // 如果不使用API，直接返回原文
       if (!this.config.useGptApi) {

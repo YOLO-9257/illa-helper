@@ -140,19 +140,38 @@ onMounted(async () => {
   settings.value = await storageService.getUserSettings();
 });
 
+// 防抖函数
+function debounce<T extends (...args: any[]) => any>(fn: T, delay: number): T {
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  return ((...args: Parameters<T>) => {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+    timeoutId = setTimeout(() => {
+      fn(...args);
+      timeoutId = null;
+    }, delay);
+  }) as T;
+}
+
+// 防抖保存函数
+const debouncedSave = debounce(async (newSettings: UserSettings) => {
+  // 关键修复：保存前获取最新的 apiConfigs，防止覆盖 TranslationSettings 的修改
+  const latestSettings = await storageService.getUserSettings();
+  newSettings.apiConfigs = latestSettings.apiConfigs;
+
+  await storageService.saveUserSettings(newSettings);
+  emit('saveMessage', t('settings.save'));
+  browser.runtime.sendMessage({
+    type: 'settings_updated',
+    settings: newSettings,
+  });
+}, 300);
+
 watch(
   settings,
-  async (newSettings) => {
-    // 关键修复：保存前获取最新的 apiConfigs，防止覆盖 TranslationSettings 的修改
-    const latestSettings = await storageService.getUserSettings();
-    newSettings.apiConfigs = latestSettings.apiConfigs;
-
-    await storageService.saveUserSettings(newSettings);
-    emit('saveMessage', t('settings.save'));
-    browser.runtime.sendMessage({
-      type: 'settings_updated',
-      settings: newSettings,
-    });
+  (newSettings) => {
+    debouncedSave(newSettings);
   },
   { deep: true },
 );

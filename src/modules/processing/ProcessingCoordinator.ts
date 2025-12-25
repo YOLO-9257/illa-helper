@@ -253,15 +253,20 @@ export class ProcessingCoordinator {
       const result = await textReplacer.replaceText(segment.textContent);
 
       if (result && result.replacements && result.replacements.length > 0) {
-        // 应用替换到DOM
-        this.applyReplacements(
-          segment,
-          result.replacements,
-          textReplacer.styleManager,
-          originalWordDisplayMode,
-          translationPosition,
-          showParentheses,
-        );
+        // 使用 requestAnimationFrame 延迟 DOM 操作，避免阻塞主线程
+        await new Promise<void>((resolve) => {
+          requestAnimationFrame(() => {
+            this.applyReplacements(
+              segment,
+              result.replacements,
+              textReplacer.styleManager,
+              originalWordDisplayMode,
+              translationPosition,
+              showParentheses,
+            );
+            resolve();
+          });
+        });
 
         // 立即为该段落的翻译内容添加发音功能
         if (this.pronunciationService) {

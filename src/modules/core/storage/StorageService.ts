@@ -148,11 +148,13 @@ export class StorageService {
 
       const userSettings: UserSettings = JSON.parse(serializedData);
 
-      // 检查是否为旧格式配置，如果是则强制重置
+      // 检查是否为旧格式配置，如果是则执行迁移（清除旧字段但保留其他设置）
       if (this.isOldFormatConfig(userSettings)) {
-        await this.saveUserSettings(DEFAULT_SETTINGS);
-        this.emitEvent(StorageEventType.SETTINGS_LOADED, DEFAULT_SETTINGS);
-        return DEFAULT_SETTINGS;
+        console.log('检测到旧格式配置，正在迁移...');
+        const migratedSettings = this.migrateOldSettings(userSettings);
+        await this.saveUserSettings(migratedSettings);
+        this.emitEvent(StorageEventType.SETTINGS_LOADED, migratedSettings);
+        return migratedSettings;
       }
 
       const validatedSettings = this.validateAndFixSettings(userSettings);
@@ -435,6 +437,37 @@ export class StorageService {
   }
 
   // ==================== 数据验证 ====================
+
+  /**
+   * 迁移旧格式配置
+   * 清除过时的字段，保留有效数据
+   */
+  private migrateOldSettings(settings: any): UserSettings {
+    // 复制当前设置
+    const newSettings = { ...settings };
+
+    // 清理 multilingualConfig 中的旧字段
+    if (newSettings.multilingualConfig) {
+      const {
+        intelligentMode: _im,
+        enableNativeSwitch: _ens,
+        sourceLanguageOverride: _slo,
+        ...rest
+      } = newSettings.multilingualConfig;
+      newSettings.multilingualConfig = {
+        ...DEFAULT_SETTINGS.multilingualConfig,
+        ...rest,
+      };
+    }
+
+    // 确保其他核心字段存在
+    if (!newSettings.apiConfigs) {
+      newSettings.apiConfigs = DEFAULT_SETTINGS.apiConfigs;
+    }
+
+    // 确保版本兼容性
+    return this.validateAndFixSettings(newSettings);
+  }
 
   /**
    * 检查是否为旧格式配置

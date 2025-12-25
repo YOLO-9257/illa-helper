@@ -6,7 +6,7 @@
  */
 
 import { ApiConfigItem } from '../../shared/types/api';
-import { StorageService } from '../../core/storage';
+import { StorageService, StorageEventType } from '../../core/storage';
 
 /**
  * 服务调度器类
@@ -33,8 +33,49 @@ export class ServiceDispatcher {
     }
   > = new Map();
 
+  // 配置缓存
+  private configCache: ApiConfigItem[] | null = null;
+
   private constructor() {
     this.storageService = StorageService.getInstance();
+
+    // 监听配置变更事件，失效缓存
+    const invalidateCache = () => {
+      this.configCache = null;
+    };
+
+    this.storageService.addEventListener(
+      StorageEventType.SETTINGS_SAVED,
+      invalidateCache,
+    );
+    this.storageService.addEventListener(
+      StorageEventType.API_CONFIG_ADDED,
+      invalidateCache,
+    );
+    this.storageService.addEventListener(
+      StorageEventType.API_CONFIG_UPDATED,
+      invalidateCache,
+    );
+    this.storageService.addEventListener(
+      StorageEventType.DATA_CLEARED,
+      invalidateCache,
+    );
+    this.storageService.addEventListener(
+      StorageEventType.SETTINGS_LOADED,
+      invalidateCache,
+    );
+
+    // 监听配置删除事件，清理对应的运行时状态缓存（避免内存泄漏）
+    this.storageService.addEventListener(
+      StorageEventType.API_CONFIG_REMOVED,
+      (event) => {
+        invalidateCache();
+        const configId = event.data?.configId;
+        if (configId && this.runtimeStatusCache.has(configId)) {
+          this.runtimeStatusCache.delete(configId);
+        }
+      },
+    );
   }
 
   /**
@@ -53,10 +94,19 @@ export class ServiceDispatcher {
    * @returns 启用的配置列表
    */
   async getEnabledConfigs(providerId?: string): Promise<ApiConfigItem[]> {
-    const settings = await this.storageService.getUserSettings();
+    // 优先使用缓存
+    let apis: ApiConfigItem[] = [];
+
+    if (this.configCache) {
+      apis = this.configCache;
+    } else {
+      const settings = await this.storageService.getUserSettings();
+      this.configCache = settings.apiConfigs;
+      apis = this.configCache;
+    }
 
     // 过滤已启用的配置
-    let configs = settings.apiConfigs.filter((c) => c.enabled !== false);
+    let configs = apis.filter((c) => c.enabled !== false);
 
     // 按服务商过滤
     if (providerId) {

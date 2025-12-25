@@ -183,18 +183,35 @@ onMounted(async () => {
   await loadSettings();
 });
 
-// 自动保存
+// 防抖函数
+function debounce<T extends (...args: any[]) => any>(fn: T, delay: number): T {
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  return ((...args: Parameters<T>) => {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+    timeoutId = setTimeout(() => {
+      fn(...args);
+      timeoutId = null;
+    }, delay);
+  }) as T;
+}
+
+// 防抖保存函数
+const debouncedSave = debounce(async (newSettings: UserSettings) => {
+  try {
+    await storageService.saveUserSettings(newSettings);
+    notifyConfigChange();
+  } catch (error) {
+    console.error(t('errors.saveSettingsFailed'), error);
+  }
+}, 300);
+
+// 自动保存（带防抖）
 watch(
   settings,
-  async (newSettings) => {
-    try {
-      // 这里我们只保存，不做其他逻辑，具体操作由各个handler触发
-      await storageService.saveUserSettings(newSettings);
-      // emit('saveMessage', '设置已保存'); // 避免频繁提示
-      notifyConfigChange();
-    } catch (error) {
-      console.error(t('errors.saveSettingsFailed'), error);
-    }
+  (newSettings) => {
+    debouncedSave(newSettings);
   },
   { deep: true },
 );

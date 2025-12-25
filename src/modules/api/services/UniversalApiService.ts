@@ -88,13 +88,17 @@ export class UniversalApiService {
   private dispatcher: ServiceDispatcher;
   private failoverExecutor: FailoverExecutor;
 
-  /** 是否启用负载均衡（多配置轮询） */
-  private enableLoadBalancing: boolean = true;
-
   private constructor() {
     this.storageService = StorageService.getInstance();
     this.dispatcher = ServiceDispatcher.getInstance();
     this.failoverExecutor = FailoverExecutor.getInstance();
+  }
+
+  /**
+   * 判断是否为 Gemini 系列 Provider
+   */
+  private isGeminiProvider(provider: string): boolean {
+    return provider === 'GoogleGemini' || provider === 'ProxyGemini';
   }
 
   /**
@@ -218,7 +222,7 @@ export class UniversalApiService {
         return result;
       },
       enabledConfigs,
-      { verbose: true },
+      { verbose: false }, // 生产环境降低日志输出
     );
 
     if (failoverResult.success && failoverResult.data) {
@@ -250,10 +254,7 @@ export class UniversalApiService {
     apiConfig: ApiConfigItem,
     options: UniversalApiOptions,
   ): Promise<UniversalApiResult> {
-    if (
-      apiConfig.provider === 'GoogleGemini' ||
-      apiConfig.provider === 'ProxyGemini'
-    ) {
+    if (this.isGeminiProvider(apiConfig.provider)) {
       return await this.callGoogleGemini(prompt, apiConfig, options);
     } else {
       return await this.callHttpApi(prompt, apiConfig, options);
@@ -435,7 +436,7 @@ export class UniversalApiService {
   }
 
   /**
-   * 聊天对话方法
+   * 聊天对话方法（支持负载均衡）
    * @param messages 消息历史
    * @param options 可选配置
    * @returns API响应结果
@@ -444,21 +445,122 @@ export class UniversalApiService {
     messages: Array<{ role: 'user' | 'assistant' | 'system'; content: string }>,
     options: UniversalApiOptions = {},
   ): Promise<UniversalApiResult> {
+    const promptSummary = messages.map((m) => m.content).join('\n');
+
     try {
-      const apiConfig = await this.getApiConfig(
-        options.configId,
-        options.forceProvider,
-      );
-      if (!apiConfig) {
-        return {
-          success: false,
-          prompt: messages.map((m) => m.content).join('\n'),
-          content: '',
-          error: '未找到可用的API配置',
-        };
+      // 如果指定了特定配置ID，直接使用该配置（不走负载均衡）
+      if (options.configId) {
+        const apiConfig = await this.getApiConfig(options.configId);
+        if (!apiConfig) {
+          return {
+            success: false,
+            prompt: promptSummary,
+            content: '',
+            error: `指定的API配置(${options.configId})不存在`,
+          };
+        }
+        return await this.executeChatWithConfig(messages, apiConfig, options);
       }
 
-      // 构建聊天请求
+      // 使用负载均衡
+      return await this.chatWithLoadBalancing(messages, options);
+    } catch (error: any) {
+      return {
+        success: false,
+        prompt: promptSummary,
+        content: '',
+        error: error.message || '聊天调用失败',
+      };
+    }
+  }
+
+  /**
+   * 带负载均衡的聊天方法
+   */
+  private async chatWithLoadBalancing(
+    messages: Array<{ role: 'user' | 'assistant' | 'system'; content: string }>,
+    options: UniversalApiOptions,
+  ): Promise<UniversalApiResult> {
+    const promptSummary = messages.map((m) => m.content).join('\n');
+
+    // 获取所有启用的配置
+    const enabledConfigs = await this.dispatcher.getEnabledConfigs(
+      options.forceProvider?.toString(),
+    );
+
+    if (enabledConfigs.length === 0) {
+      return {
+        success: false,
+        prompt: promptSummary,
+        content: '',
+        error: '无可用的API配置（所有配置已禁用或处于冷却期）',
+      };
+    }
+
+    // 使用故障转移执行器
+    const failoverResult = await this.failoverExecutor.executeWithFailover(
+      async (config: ApiConfigItem) => {
+        const result = await this.executeChatWithConfig(
+          messages,
+          config,
+          options,
+        );
+
+        if (!result.success) {
+          throw new RetryableError(
+            result.error || 'Chat调用失败',
+            undefined,
+            true,
+          );
+        }
+
+        return result;
+      },
+      enabledConfigs,
+      { verbose: false },
+    );
+
+    if (failoverResult.success && failoverResult.data) {
+      return {
+        ...failoverResult.data,
+        usedConfigId: failoverResult.usedConfigId,
+        usedConfigName: failoverResult.usedConfigName,
+        attempts: failoverResult.attempts,
+      };
+    } else {
+      return {
+        success: false,
+        prompt: promptSummary,
+        content: '',
+        error: failoverResult.error || '所有API配置均调用失败',
+        attempts: failoverResult.attempts,
+      };
+    }
+  }
+
+  /**
+   * 使用指定配置执行聊天
+   */
+  private async executeChatWithConfig(
+    messages: Array<{ role: 'user' | 'assistant' | 'system'; content: string }>,
+    apiConfig: ApiConfigItem,
+    options: UniversalApiOptions,
+  ): Promise<UniversalApiResult> {
+    const promptSummary = messages[messages.length - 1]?.content || '';
+
+    try {
+      // Gemini 不支持标准的 chat messages 格式，需要转换
+      if (this.isGeminiProvider(apiConfig.provider)) {
+        // 对于 Gemini，将 messages 合并为一个 prompt
+        const combinedPrompt = messages
+          .map((m) =>
+            m.role === 'system' ? `[System] ${m.content}` : m.content,
+          )
+          .join('\n\n');
+        return await this.callGoogleGemini(combinedPrompt, apiConfig, options);
+      }
+
+      // 构建聊天请求 (OpenAI 兼容格式)
       let requestBody: any = {
         model: apiConfig.config.model,
         messages: messages,
@@ -486,8 +588,10 @@ export class UniversalApiService {
       );
 
       if (!response.ok) {
-        throw new Error(
+        throw new RetryableError(
           `API请求失败: ${response.status} ${response.statusText}`,
+          response.status,
+          true,
         );
       }
 
@@ -495,16 +599,16 @@ export class UniversalApiService {
 
       return this.parseResponse(
         data,
-        messages[messages.length - 1].content,
+        promptSummary,
         apiConfig,
         options.rawResponse,
       );
     } catch (error: any) {
       return {
         success: false,
-        prompt: messages.map((m) => m.content).join('\n'),
+        prompt: promptSummary,
         content: '',
-        error: error.message || '聊天调用失败',
+        error: error.message || 'Chat调用失败',
       };
     }
   }
@@ -638,10 +742,7 @@ export class UniversalApiService {
       let usage: any = undefined;
 
       // 根据不同的Provider解析响应格式
-      if (
-        apiConfig.provider === 'GoogleGemini' ||
-        apiConfig.provider === 'ProxyGemini'
-      ) {
+      if (this.isGeminiProvider(apiConfig.provider)) {
         // Google Gemini格式 (包括ProxyGemini)
         content = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
         if (data.usageMetadata) {
