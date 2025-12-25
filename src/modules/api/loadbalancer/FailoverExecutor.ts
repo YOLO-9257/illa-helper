@@ -71,12 +71,14 @@ export class RetryableError extends Error {
  * 故障转移执行器选项
  */
 export interface FailoverExecutorOptions {
-  /** 冷却时间（毫秒） */
+  /** 冷却时间（毫秒），默认30秒 */
   cooldownDuration?: number;
   /** 可重试的HTTP状态码 */
   retryableStatusCodes?: number[];
   /** 是否输出详细日志 */
   verbose?: boolean;
+  /** 是否启用动态冷却（根据错误类型调整冷却时间） */
+  dynamicCooldown?: boolean;
 }
 
 /**
@@ -180,9 +182,10 @@ export class FailoverExecutor {
     options: FailoverExecutorOptions = {},
   ): Promise<FailoverResult<T>> {
     const {
-      cooldownDuration = 60000,
+      cooldownDuration = 30000, // 默认 30 秒，较短的冷却时间提高效率
       retryableStatusCodes = this.defaultRetryableStatusCodes,
-      verbose = true,
+      verbose = false, // 默认关闭日志提高性能
+      dynamicCooldown = true, // 默认启用动态冷却
     } = options;
 
     // 构建故障转移队列
@@ -266,13 +269,28 @@ export class FailoverExecutor {
         }
 
         // 标记配置错误并进入冷却期
+        // 动态冷却：429 限流错误使用更长的冷却时间
+        let actualCooldown = cooldownDuration;
+        if (dynamicCooldown && statusCode) {
+          if (statusCode === 429) {
+            // 限流错误：冷却 2 分钟
+            actualCooldown = Math.max(cooldownDuration, 120000);
+          } else if (statusCode >= 500) {
+            // 服务器错误：使用默认冷却
+            actualCooldown = cooldownDuration;
+          } else {
+            // 其他错误：较短冷却（15秒）
+            actualCooldown = Math.min(cooldownDuration, 15000);
+          }
+        }
+
         this.dispatcher.markConfigError(
           config.id,
           {
             code: statusCode || 0,
             message: error.message || String(error),
           },
-          cooldownDuration,
+          actualCooldown,
         );
 
         // 判断是否可重试

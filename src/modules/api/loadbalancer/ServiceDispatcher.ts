@@ -36,12 +36,19 @@ export class ServiceDispatcher {
   // 配置缓存
   private configCache: ApiConfigItem[] | null = null;
 
+  // 启用配置缓存（性能优化：避免每次过滤）
+  private enabledConfigsCache: Map<string, ApiConfigItem[]> = new Map();
+  private cacheTimestamp: number = 0;
+  private readonly CACHE_TTL_MS = 1000; // 缓存有效期 1 秒
+
   private constructor() {
     this.storageService = StorageService.getInstance();
 
-    // 监听配置变更事件，失效缓存
+    // 监听配置变更事件，失效所有缓存
     const invalidateCache = () => {
       this.configCache = null;
+      this.enabledConfigsCache.clear();
+      this.cacheTimestamp = 0;
     };
 
     this.storageService.addEventListener(
@@ -89,14 +96,27 @@ export class ServiceDispatcher {
   }
 
   /**
-   * 获取所有启用的配置
+   * 获取所有启用的配置（带智能缓存）
    * @param providerId 可选，按服务商ID过滤
    * @returns 启用的配置列表
    */
   async getEnabledConfigs(providerId?: string): Promise<ApiConfigItem[]> {
-    // 优先使用缓存
-    let apis: ApiConfigItem[] = [];
+    const now = Date.now();
+    const cacheKey = providerId || '__all__';
 
+    // 检查缓存是否有效
+    if (
+      this.cacheTimestamp > 0 &&
+      now - this.cacheTimestamp < this.CACHE_TTL_MS &&
+      this.enabledConfigsCache.has(cacheKey)
+    ) {
+      // 快速路径：使用缓存的结果，但仍需检查冷却状态
+      const cachedConfigs = this.enabledConfigsCache.get(cacheKey)!;
+      return this.filterCooldownConfigs(cachedConfigs, now);
+    }
+
+    // 缓存未命中，重新获取
+    let apis: ApiConfigItem[];
     if (this.configCache) {
       apis = this.configCache;
     } else {
@@ -113,20 +133,40 @@ export class ServiceDispatcher {
       configs = configs.filter((c) => c.provider === providerId);
     }
 
+    // 更新缓存
+    this.enabledConfigsCache.set(cacheKey, configs);
+    this.cacheTimestamp = now;
+
     // 过滤冷却中的配置
-    const now = Date.now();
-    configs = configs.filter((c) => {
-      const cachedStatus = this.runtimeStatusCache.get(c.id);
-      const cooldownUntil = cachedStatus?.cooldownUntil;
+    return this.filterCooldownConfigs(configs, now);
+  }
 
-      if (cooldownUntil && now < cooldownUntil) {
-        return false;
+  /**
+   * 过滤冷却中的配置（内联优化）
+   */
+  private filterCooldownConfigs(
+    configs: ApiConfigItem[],
+    now: number,
+  ): ApiConfigItem[] {
+    // 快速路径：如果没有任何配置在冷却中，直接返回
+    if (this.runtimeStatusCache.size === 0) {
+      return configs;
+    }
+
+    // 快速路径：只有一个配置时，直接检查
+    if (configs.length === 1) {
+      const status = this.runtimeStatusCache.get(configs[0].id);
+      if (!status?.cooldownUntil || now >= status.cooldownUntil) {
+        return configs;
       }
+      return [];
+    }
 
-      return true;
+    // 多配置过滤
+    return configs.filter((c) => {
+      const cachedStatus = this.runtimeStatusCache.get(c.id);
+      return !cachedStatus?.cooldownUntil || now >= cachedStatus.cooldownUntil;
     });
-
-    return configs;
   }
 
   /**
