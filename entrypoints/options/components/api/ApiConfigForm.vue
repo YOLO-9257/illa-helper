@@ -102,22 +102,33 @@
           />
         </div>
 
-        <!-- API Key -->
+        <!-- API Key (支持多 Key) -->
         <div class="space-y-2">
-          <Label>{{ $t('translationSettings.apiKey') }}</Label>
+          <div class="flex items-center justify-between">
+            <Label>{{ $t('translationSettings.apiKey') }}</Label>
+            <span
+              v-if="apiKeyCount > 1"
+              class="text-xs bg-primary/10 text-primary px-2 py-0.5 rounded-full"
+            >
+              {{ apiKeyCount }} Keys
+            </span>
+          </div>
           <div class="relative">
-            <Input
-              :type="showPassword ? 'text' : 'password'"
+            <textarea
               v-model="formData.config.apiKey"
-              :placeholder="$t('translationSettings.inputApiKey')"
-              class="pr-10"
+              :placeholder="
+                $t('translationSettings.inputApiKey') +
+                ' (支持多 Key，逗号或换行分隔)'
+              "
+              class="w-full min-h-[80px] p-3 text-sm font-mono border rounded-md resize-y"
+              :class="showPassword ? '' : 'text-security-disc'"
             />
             <Button
               @click="showPassword = !showPassword"
               type="button"
               variant="ghost"
               size="sm"
-              class="absolute right-0 top-0 h-full px-3 py-2 hover:bg-transparent"
+              class="absolute right-2 top-2 h-8 w-8 p-0"
             >
               <Eye v-if="!showPassword" class="h-4 w-4 text-muted-foreground" />
               <EyeOff v-else class="h-4 w-4 text-muted-foreground" />
@@ -262,23 +273,36 @@
             <Label class="text-sm font-medium">
               {{ $t('translationSettings.apiConnectionTest') }}
             </Label>
-            <Button
-              @click="testConnection"
-              :disabled="isTesting || !formData.config.apiKey"
-              size="sm"
-            >
-              <span v-if="isTesting" class="animate-spin mr-2">⏳</span>
-              {{ $t('translationSettings.testConnection') }}
-            </Button>
+            <div class="flex gap-2">
+              <Button
+                v-if="apiKeyCount > 1"
+                @click="testAllKeys"
+                :disabled="isTestingAll || !formData.config.apiKey"
+                size="sm"
+                variant="outline"
+              >
+                <span v-if="isTestingAll" class="animate-spin mr-2">⏳</span>
+                测试所有 Key
+              </Button>
+              <Button
+                @click="testConnection"
+                :disabled="isTesting || !formData.config.apiKey"
+                size="sm"
+              >
+                <span v-if="isTesting" class="animate-spin mr-2">⏳</span>
+                {{ $t('translationSettings.testConnection') }}
+              </Button>
+            </div>
           </div>
 
+          <!-- 单 Key 测试结果 -->
           <div
             v-if="testResult"
             class="text-sm p-2 rounded-md"
             :class="
               testResult.success
-                ? 'bg-green-50 text-green-700'
-                : 'bg-red-50 text-red-700'
+                ? 'bg-green-50 text-green-700 dark:bg-green-900/20 dark:text-green-400'
+                : 'bg-red-50 text-red-700 dark:bg-red-900/20 dark:text-red-400'
             "
           >
             <div class="flex items-center">
@@ -290,6 +314,31 @@
             </div>
             <div v-if="testResult.message" class="mt-1 text-xs">
               {{ testResult.message }}
+            </div>
+          </div>
+
+          <!-- 批量测试结果 -->
+          <div v-if="batchTestResults.length > 0" class="mt-2 space-y-1">
+            <div
+              v-for="(result, index) in batchTestResults"
+              :key="index"
+              class="text-xs p-2 rounded flex items-center gap-2"
+              :class="
+                result.success
+                  ? 'bg-green-50 text-green-700 dark:bg-green-900/20 dark:text-green-400'
+                  : 'bg-red-50 text-red-700 dark:bg-red-900/20 dark:text-red-400'
+              "
+            >
+              <component
+                :is="result.success ? CheckCircle2Icon : XCircle"
+                class="h-3 w-3 flex-shrink-0"
+              />
+              <span class="font-mono truncate">
+                Key #{{ index + 1 }}: {{ result.maskedKey }}
+              </span>
+              <span v-if="result.message" class="truncate opacity-70">
+                {{ result.message }}
+              </span>
             </div>
           </div>
         </div>
@@ -363,7 +412,11 @@ const emit = defineEmits<{
 const showPassword = ref(false);
 const showAdvanced = ref(false);
 const isTesting = ref(false);
+const isTestingAll = ref(false);
 const testResult = ref<ApiTestResult | null>(null);
+const batchTestResults = ref<
+  Array<{ success: boolean; maskedKey: string; message?: string }>
+>([]);
 const customParamsError = ref('');
 
 // 表单数据
@@ -387,6 +440,20 @@ const formData = ref({
 });
 
 const isEditing = computed(() => !!props.initialConfig);
+
+// 解析多 Key
+const parseApiKeys = (raw: string): string[] => {
+  if (!raw) return [];
+  return raw
+    .split(/[,\n]/)
+    .map((k) => k.trim())
+    .filter((k) => k.length > 0);
+};
+
+// Key 数量
+const apiKeyCount = computed(
+  () => parseApiKeys(formData.value.config.apiKey).length,
+);
 
 // 预定义配置
 const providerConfigs = {
@@ -522,5 +589,67 @@ const testConnection = async () => {
   } finally {
     isTesting.value = false;
   }
+};
+
+// 批量测试所有 Key
+const testAllKeys = async () => {
+  const keys = parseApiKeys(formData.value.config.apiKey);
+  if (keys.length === 0) return;
+
+  isTestingAll.value = true;
+  batchTestResults.value = [];
+  testResult.value = null;
+
+  const provider = formData.value.provider;
+  // 批量测试使用固定 30 秒超时，避免无限等待
+  const testTimeout = props.settings?.apiRequestTimeout || 30000;
+
+  const results = await Promise.allSettled(
+    keys.map(async (key, index) => {
+      const maskedKey =
+        key.length > 12 ? `${key.substring(0, 8)}...${key.slice(-4)}` : '***';
+      try {
+        const tempConfig = { ...formData.value.config, apiKey: key };
+        let result: ApiTestResult;
+
+        if (provider === 'GoogleGemini' || provider === 'ProxyGemini') {
+          result = await testGeminiConnection(tempConfig, testTimeout);
+        } else {
+          const tempItem = {
+            id: `temp-${index}`,
+            name: formData.value.name,
+            provider,
+            config: tempConfig,
+            isDefault: false,
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            enabled: true,
+          } as ApiConfigItem;
+          result = await testApiConnection(tempItem, testTimeout);
+        }
+
+        return { success: result.success, maskedKey, message: result.message };
+      } catch (e: any) {
+        return { success: false, maskedKey, message: e.message };
+      }
+    }),
+  );
+
+  batchTestResults.value = results.map((r, i) => {
+    if (r.status === 'fulfilled') {
+      return r.value;
+    } else {
+      const key = keys[i];
+      const maskedKey =
+        key.length > 12 ? `${key.substring(0, 8)}...${key.slice(-4)}` : '***';
+      return {
+        success: false,
+        maskedKey,
+        message: r.reason?.message || '测试失败',
+      };
+    }
+  });
+
+  isTestingAll.value = false;
 };
 </script>

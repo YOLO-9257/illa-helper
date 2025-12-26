@@ -97,44 +97,78 @@
       @cancel="closeDialog"
     />
 
-    <!-- 开发者诊断工具 -->
+    <!-- 系统诊断工具 -->
     <Card class="border-dashed border-muted-foreground/30 bg-muted/20 mt-8">
       <CardHeader class="pb-2">
         <CardTitle
-          class="text-base text-muted-foreground flex items-center justify-between"
+          class="text-base text-muted-foreground flex items-center justify-between flex-wrap gap-2"
         >
           <div class="flex items-center gap-2">
             <ActivityIcon class="h-4 w-4" />
             <span>{{ $t('translationSettings.diagnostics', '系统诊断') }}</span>
           </div>
-          <Button
-            @click="runDiagnostics"
-            size="sm"
-            variant="outline"
-            :disabled="isRunningDiagnostics"
-          >
-            <span v-if="isRunningDiagnostics" class="animate-spin mr-2">
-              ⏳
-            </span>
-            {{ $t('translationSettings.runSelfCheck', '运行负载均衡自检') }}
-          </Button>
+          <div class="flex gap-2 flex-wrap">
+            <Button
+              @click="showConfigStatus"
+              size="sm"
+              variant="outline"
+              :disabled="isRunningDiagnostics || isTestingConfigs"
+            >
+              <ClipboardListIcon class="h-4 w-4 mr-1.5" />
+              查看配置状态
+            </Button>
+            <Button
+              @click="testAllConfigs"
+              size="sm"
+              variant="default"
+              :disabled="isTestingConfigs || settings.apiConfigs.length === 0"
+            >
+              <span v-if="isTestingConfigs" class="animate-spin mr-2">⏳</span>
+              <ZapIcon v-else class="h-4 w-4 mr-1.5" />
+              检测所有 API
+            </Button>
+            <Button
+              @click="runDiagnostics"
+              size="sm"
+              variant="outline"
+              :disabled="isRunningDiagnostics"
+            >
+              <span v-if="isRunningDiagnostics" class="animate-spin mr-2">
+                ⏳
+              </span>
+              单元测试
+            </Button>
+          </div>
         </CardTitle>
       </CardHeader>
       <CardContent v-if="diagnosticLogs.length > 0">
         <div
-          class="bg-black/90 p-3 rounded-md font-mono text-xs overflow-y-auto max-h-60 space-y-1"
+          class="bg-black/90 p-3 rounded-md font-mono text-xs overflow-y-auto max-h-80 space-y-1"
         >
           <div
             v-for="(log, idx) in diagnosticLogs"
             :key="idx"
-            class="text-white break-words"
+            class="text-white break-words whitespace-pre-wrap"
             :class="{
-              'text-green-400': log.includes('✅'),
-              'text-red-400': log.includes('❌'),
+              'text-green-400': log.includes('✅') || log.includes('[成功]'),
+              'text-red-400': log.includes('❌') || log.includes('[失败]'),
+              'text-yellow-400': log.includes('⚠️') || log.includes('[冷却]'),
+              'text-blue-400': log.includes('ℹ️') || log.includes('[信息]'),
+              'text-gray-400': log.includes('---'),
             }"
           >
             {{ log }}
           </div>
+        </div>
+        <div class="flex justify-end mt-2">
+          <Button
+            @click="clearDiagnosticLogs"
+            size="sm"
+            variant="ghost"
+            class="text-xs text-muted-foreground"
+          >
+            清空日志
+          </Button>
         </div>
       </CardContent>
     </Card>
@@ -157,7 +191,13 @@ import { Input } from '@/components/ui/input';
 import ApiConfigList from '../api/ApiConfigList.vue';
 import ApiConfigForm from '../api/ApiConfigForm.vue';
 import { LoadBalancerTestSuite } from '@/src/modules/api/loadbalancer/tests/LoadBalancerTestSuite';
-import { Activity as ActivityIcon } from 'lucide-vue-next';
+import { ServiceDispatcher } from '@/src/modules/api/loadbalancer/ServiceDispatcher';
+import { testApiConnection } from '@/src/utils';
+import {
+  Activity as ActivityIcon,
+  ClipboardList as ClipboardListIcon,
+  Zap as ZapIcon,
+} from 'lucide-vue-next';
 
 const { t } = useI18n();
 const settings = ref<UserSettings>({ ...DEFAULT_SETTINGS });
@@ -332,23 +372,151 @@ const handleSetActive = (id: string) => {
 
 // 诊断测试
 const isRunningDiagnostics = ref(false);
+const isTestingConfigs = ref(false);
 const diagnosticLogs = ref<string[]>([]);
 
+const logMessage = (message: string) => {
+  const timestamp = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+  diagnosticLogs.value.push(`[${timestamp}] ${message}`);
+};
+
+const clearDiagnosticLogs = () => {
+  diagnosticLogs.value = [];
+};
+
+// 查看当前配置的运行时状态
+const showConfigStatus = async () => {
+  diagnosticLogs.value = [];
+  const dispatcher = ServiceDispatcher.getInstance();
+  const configs = settings.value.apiConfigs;
+
+  logMessage('ℹ️ ===== 当前 API 配置运行时状态 =====');
+  logMessage(`ℹ️ 配置总数: ${configs.length}`);
+
+  if (configs.length === 0) {
+    logMessage('⚠️ 暂无配置的 API');
+    return;
+  }
+
+  const statusList = dispatcher.getAllConfigsStatus(configs);
+  const enabledCount = statusList.filter((s) => s.enabled).length;
+  const availableCount = statusList.filter(
+    (s) => s.enabled && !s.isInCooldown,
+  ).length;
+
+  logMessage(`ℹ️ 已启用: ${enabledCount}，当前可用: ${availableCount}`);
+  logMessage('-------------------------------------------');
+
+  for (const status of statusList) {
+    const enabledTag = status.enabled ? '✅ 已启用' : '❌ 已禁用';
+    const cooldownTag = status.isInCooldown
+      ? `⚠️ [冷却中: ${Math.ceil((status.cooldownRemainingMs || 0) / 1000)}s]`
+      : '';
+    const keyInfo = status.keyCount > 1 ? `(${status.keyCount} Keys)` : '';
+
+    logMessage(`📌 ${status.configName} [${status.provider}] ${keyInfo}`);
+    logMessage(`   状态: ${enabledTag} ${cooldownTag}`);
+    logMessage(`   成功/失败: ${status.successCount}/${status.failureCount}`);
+
+    if (status.lastUsed) {
+      const lastUsedTime = new Date(status.lastUsed).toLocaleString('zh-CN');
+      logMessage(`   最后使用: ${lastUsedTime}`);
+    }
+
+    if (status.lastError) {
+      const errorTime = new Date(status.lastError.timestamp).toLocaleTimeString(
+        'zh-CN',
+      );
+      logMessage(`   ❌ 最后错误 [${errorTime}]: ${status.lastError.message}`);
+    }
+
+    logMessage('');
+  }
+
+  logMessage(`ℹ️ 当前轮询索引: ${dispatcher.getCurrentIndex()}`);
+  emit(
+    'saveMessage',
+    `状态查看完成：${availableCount}/${enabledCount} 配置可用`,
+  );
+};
+
+// 检测所有真实 API 配置
+const testAllConfigs = async () => {
+  isTestingConfigs.value = true;
+  diagnosticLogs.value = [];
+
+  const configs = settings.value.apiConfigs;
+  const timeout = settings.value.apiRequestTimeout || 30000;
+
+  logMessage('ℹ️ ===== 开始检测所有 API 配置 =====');
+  logMessage(`ℹ️ 配置数量: ${configs.length}，超时: ${timeout / 1000}s`);
+  logMessage('-------------------------------------------');
+
+  let successCount = 0;
+  let failCount = 0;
+
+  for (const config of configs) {
+    const keyCount = (config.config?.apiKey || '')
+      .split(/[,\n\r]/)
+      .filter((k: string) => k.trim()).length;
+    const keyInfo = keyCount > 1 ? `(${keyCount} Keys)` : '';
+
+    logMessage(`🔍 测试: ${config.name} [${config.provider}] ${keyInfo}`);
+
+    if (config.enabled === false) {
+      logMessage(`   ⚠️ 已禁用，跳过测试`);
+      continue;
+    }
+
+    try {
+      const startTime = Date.now();
+      const result = await testApiConnection(config, timeout);
+      const duration = Date.now() - startTime;
+
+      if (result.success) {
+        successCount++;
+        logMessage(`   ✅ [成功] ${result.message || 'OK'} (${duration}ms)`);
+        if (result.model) {
+          logMessage(`   📦 模型: ${result.model}`);
+        }
+      } else {
+        failCount++;
+        logMessage(
+          `   ❌ [失败] ${result.message || '未知错误'} (${duration}ms)`,
+        );
+      }
+    } catch (e: any) {
+      failCount++;
+      logMessage(`   ❌ [异常] ${e.message}`);
+    }
+
+    logMessage('');
+  }
+
+  logMessage('-------------------------------------------');
+  logMessage(`ℹ️ 检测完成：✅ 成功 ${successCount}，❌ 失败 ${failCount}`);
+
+  emit('saveMessage', `API 检测完成：${successCount} 成功，${failCount} 失败`);
+  isTestingConfigs.value = false;
+};
+
+// 运行负载均衡单元测试
 const runDiagnostics = async () => {
   isRunningDiagnostics.value = true;
   diagnosticLogs.value = [];
   try {
+    logMessage('ℹ️ ===== 负载均衡单元测试 =====');
     const suite = new LoadBalancerTestSuite();
     const result = await suite.run();
-    diagnosticLogs.value = result.logs;
+    diagnosticLogs.value = [...diagnosticLogs.value, ...result.logs];
     if (result.failed > 0) {
-      emit('saveMessage', `诊断完成：${result.failed} 项测试失败`);
+      emit('saveMessage', `单元测试完成：${result.failed} 项测试失败`);
     } else {
-      emit('saveMessage', `诊断完成：全部通过`);
+      emit('saveMessage', `单元测试完成：全部通过`);
     }
   } catch (e: any) {
     console.error(e);
-    diagnosticLogs.value.push(`❌ 执行异常: ${e.message}`);
+    logMessage(`❌ 执行异常: ${e.message}`);
   } finally {
     isRunningDiagnostics.value = false;
   }

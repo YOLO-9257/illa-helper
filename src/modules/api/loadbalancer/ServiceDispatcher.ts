@@ -305,6 +305,211 @@ export class ServiceDispatcher {
   getCurrentIndex(): number {
     return this.currentIndex;
   }
+
+  /**
+   * 获取所有配置的运行时状态摘要（用于系统诊断）
+   * @param configs 配置列表
+   * @returns 每个配置的状态信息数组
+   */
+  getAllConfigsStatus(configs: ApiConfigItem[]): {
+    configId: string;
+    configName: string;
+    provider: string;
+    enabled: boolean;
+    successCount: number;
+    failureCount: number;
+    lastUsed?: number;
+    isInCooldown: boolean;
+    cooldownRemainingMs?: number;
+    lastError?: { code: number; message: string; timestamp: number };
+    keyCount: number;
+  }[] {
+    const now = Date.now();
+    return configs.map((config) => {
+      const status = this.runtimeStatusCache.get(config.id);
+      const isEnabled = config.enabled !== false;
+
+      // 解析 API Key 数量
+      const keys = this.parseApiKeys(config.config?.apiKey || '');
+
+      let cooldownRemainingMs: number | undefined;
+      if (status?.cooldownUntil && now < status.cooldownUntil) {
+        cooldownRemainingMs = status.cooldownUntil - now;
+      }
+
+      return {
+        configId: config.id,
+        configName: config.name,
+        provider: config.provider,
+        enabled: isEnabled,
+        successCount: status?.successCount || 0,
+        failureCount: status?.failureCount || 0,
+        lastUsed: status?.lastUsed,
+        isInCooldown: !!(status?.cooldownUntil && now < status.cooldownUntil),
+        cooldownRemainingMs,
+        lastError: status?.lastError,
+        keyCount: keys.length,
+      };
+    });
+  }
+
+  // ========== 多 Key 轮询支持 ==========
+
+  /**
+   * 解析 API Key 字符串，支持逗号或换行分隔
+   * @param apiKeyRaw 原始 Key 字符串
+   * @returns 解析后的 Key 数组
+   */
+  parseApiKeys(apiKeyRaw: string): string[] {
+    if (!apiKeyRaw) return [];
+    return apiKeyRaw
+      .split(/[,\n\r]/)
+      .map((k) => k.trim())
+      .filter((k) => k.length > 0);
+  }
+
+  /**
+   * 获取下一个可用的 API Key（轮询 + 冷却跳过）
+   * @param configId 配置 ID
+   * @param apiKeyRaw 原始 Key 字符串（可能包含多个）
+   * @returns 可用的 Key，如果全部在冷却中则返回 null
+   */
+  getNextAvailableApiKey(configId: string, apiKeyRaw: string): string | null {
+    const keys = this.parseApiKeys(apiKeyRaw);
+    if (keys.length === 0) return null;
+    if (keys.length === 1) return keys[0]; // 单 Key 直接返回
+
+    const now = Date.now();
+    const status = this.runtimeStatusCache.get(configId) || {
+      successCount: 0,
+      failureCount: 0,
+    };
+
+    // 获取或初始化 keyStatuses
+    let keyStatuses = (status as any).keyStatuses as
+      | Map<string, { cooldownUntil?: number }>
+      | undefined;
+    if (!keyStatuses) {
+      keyStatuses = new Map();
+      (status as any).keyStatuses = keyStatuses;
+      this.runtimeStatusCache.set(configId, status);
+    }
+
+    // 获取当前轮询索引
+    const rotationIndex = (status as any).keyRotationIndex || 0;
+    const startIndex = rotationIndex;
+
+    // 尝试找到一个不在冷却中的 Key
+    for (let i = 0; i < keys.length; i++) {
+      const idx = (startIndex + i) % keys.length;
+      const key = keys[idx];
+      const keyStatus = keyStatuses.get(key);
+
+      if (!keyStatus?.cooldownUntil || now >= keyStatus.cooldownUntil) {
+        // 找到可用 Key，更新索引
+        (status as any).keyRotationIndex = (idx + 1) % keys.length;
+        this.runtimeStatusCache.set(configId, status);
+        console.log(
+          `[ServiceDispatcher] 使用 Key #${idx + 1}/${keys.length} (${key.substring(0, 8)}...)`,
+        );
+        return key;
+      }
+    }
+
+    // 所有 Key 都在冷却中
+    console.warn('[ServiceDispatcher] 所有 API Key 均在冷却中');
+    return null;
+  }
+
+  /**
+   * 标记某个 API Key 调用失败，进入冷却期
+   * @param configId 配置 ID
+   * @param apiKey 失败的 Key
+   * @param error 错误信息
+   * @param cooldownDuration 冷却时间（毫秒），默认 60 秒
+   */
+  markApiKeyError(
+    configId: string,
+    apiKey: string,
+    error: { code: number; message: string },
+    cooldownDuration: number = 60000,
+  ): void {
+    const status = this.runtimeStatusCache.get(configId) || {
+      successCount: 0,
+      failureCount: 0,
+    };
+
+    let keyStatuses = (status as any).keyStatuses as
+      | Map<
+          string,
+          {
+            successCount: number;
+            failureCount: number;
+            cooldownUntil?: number;
+            lastError?: { code: number; message: string; timestamp: number };
+          }
+        >
+      | undefined;
+    if (!keyStatuses) {
+      keyStatuses = new Map();
+      (status as any).keyStatuses = keyStatuses;
+    }
+
+    const existing = keyStatuses.get(apiKey) || {
+      successCount: 0,
+      failureCount: 0,
+    };
+    keyStatuses.set(apiKey, {
+      ...existing,
+      failureCount: existing.failureCount + 1,
+      cooldownUntil: Date.now() + cooldownDuration,
+      lastError: {
+        code: error.code,
+        message: error.message,
+        timestamp: Date.now(),
+      },
+    });
+
+    this.runtimeStatusCache.set(configId, status);
+    console.log(
+      `[ServiceDispatcher] Key ${apiKey.substring(0, 8)}... 进入冷却期 ${cooldownDuration / 1000}s`,
+    );
+  }
+
+  /**
+   * 标记某个 API Key 调用成功
+   * @param configId 配置 ID
+   * @param apiKey 成功的 Key
+   */
+  markApiKeySuccess(configId: string, apiKey: string): void {
+    const status = this.runtimeStatusCache.get(configId) || {
+      successCount: 0,
+      failureCount: 0,
+    };
+
+    let keyStatuses = (status as any).keyStatuses as
+      | Map<
+          string,
+          { successCount: number; failureCount: number; cooldownUntil?: number }
+        >
+      | undefined;
+    if (!keyStatuses) {
+      keyStatuses = new Map();
+      (status as any).keyStatuses = keyStatuses;
+    }
+
+    const existing = keyStatuses.get(apiKey) || {
+      successCount: 0,
+      failureCount: 0,
+    };
+    keyStatuses.set(apiKey, {
+      ...existing,
+      successCount: existing.successCount + 1,
+      cooldownUntil: undefined, // 成功后清除冷却
+    });
+
+    this.runtimeStatusCache.set(configId, status);
+  }
 }
 
 // 导出单例实例

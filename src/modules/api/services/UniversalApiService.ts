@@ -262,16 +262,31 @@ export class UniversalApiService {
   }
 
   /**
-   * 调用Google Gemini SDK
+   * 调用Google Gemini SDK（支持多 Key 轮询）
    */
   private async callGoogleGemini(
     prompt: string,
     apiConfig: ApiConfigItem,
     options: UniversalApiOptions,
   ): Promise<UniversalApiResult> {
+    const config = apiConfig.config;
+
+    // 获取轮询后的 API Key
+    const actualApiKey = this.dispatcher.getNextAvailableApiKey(
+      apiConfig.id,
+      config.apiKey,
+    );
+    if (!actualApiKey) {
+      return {
+        success: false,
+        prompt,
+        content: '',
+        error: '所有 API Key 均在冷却中，请稍后重试',
+      };
+    }
+
     try {
-      const config = apiConfig.config;
-      const genAI = new GoogleGenerativeAI(config.apiKey);
+      const genAI = new GoogleGenerativeAI(actualApiKey);
 
       // 基础生成配置
       const baseGenerationConfig: any = {
@@ -324,6 +339,9 @@ export class UniversalApiService {
 
       console.log('Google Gemini响应:', content);
 
+      // 标记成功
+      this.dispatcher.markApiKeySuccess(apiConfig.id, actualApiKey);
+
       // 构建返回结果
       const apiResult: UniversalApiResult = {
         success: true,
@@ -353,6 +371,11 @@ export class UniversalApiService {
       return apiResult;
     } catch (error: any) {
       console.error('Google Gemini调用失败:', error);
+      // 标记失败，进入冷却期
+      this.dispatcher.markApiKeyError(apiConfig.id, actualApiKey, {
+        code: error.status || 500,
+        message: error.message || 'Google Gemini调用失败',
+      });
       return {
         success: false,
         prompt,
@@ -363,35 +386,62 @@ export class UniversalApiService {
   }
 
   /**
-   * 调用HTTP API (OpenAI兼容格式)
+   * 调用HTTP API (OpenAI兼容格式，支持多 Key 轮询)
    */
   private async callHttpApi(
     prompt: string,
     apiConfig: ApiConfigItem,
     options: UniversalApiOptions,
   ): Promise<UniversalApiResult> {
+    const config = apiConfig.config;
+
+    // 获取轮询后的 API Key
+    const actualApiKey = this.dispatcher.getNextAvailableApiKey(
+      apiConfig.id,
+      config.apiKey,
+    );
+    if (!actualApiKey) {
+      return {
+        success: false,
+        prompt,
+        content: '',
+        error: '所有 API Key 均在冷却中，请稍后重试',
+      };
+    }
+
+    // 创建使用实际 Key 的配置副本
+    const effectiveConfig: typeof config = {
+      ...config,
+      apiKey: actualApiKey,
+    };
+
     try {
       // 构建请求参数
       const requestBody = this.buildRequestBody(
         prompt,
-        apiConfig.config,
+        effectiveConfig,
         options,
       );
 
       console.log('HTTP API调用:', {
         provider: apiConfig.provider,
-        endpoint: apiConfig.config.apiEndpoint,
+        endpoint: effectiveConfig.apiEndpoint,
         body: requestBody,
       });
 
       // 发送API请求
       const response = await this.sendRequest(
         requestBody,
-        apiConfig.config,
+        effectiveConfig,
         options.timeout,
       );
 
       if (!response.ok) {
+        // 标记失败
+        this.dispatcher.markApiKeyError(apiConfig.id, actualApiKey, {
+          code: response.status,
+          message: response.statusText,
+        });
         // 引入 RetryableError 并设置状态码，保证故障转移逻辑能识别
         const retryableError = new RetryableError(
           `API请求失败: ${response.status} ${response.statusText}`,
@@ -405,10 +455,20 @@ export class UniversalApiService {
 
       console.log('HTTP API响应:', data);
 
+      // 标记成功
+      this.dispatcher.markApiKeySuccess(apiConfig.id, actualApiKey);
+
       // 解析响应
       return this.parseResponse(data, prompt, apiConfig, options.rawResponse);
     } catch (error: any) {
       console.error('HTTP API调用失败:', error);
+      // 如果不是已标记的错误，也标记一下
+      if (!(error instanceof RetryableError)) {
+        this.dispatcher.markApiKeyError(apiConfig.id, actualApiKey, {
+          code: 500,
+          message: error.message || 'HTTP API调用失败',
+        });
+      }
       return {
         success: false,
         prompt,

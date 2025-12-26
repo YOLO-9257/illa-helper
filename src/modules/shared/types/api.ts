@@ -42,6 +42,19 @@ export interface ApiConfig {
   useBackgroundProxy?: boolean; // 是否通过background script发送请求以绕过CORS
 }
 
+// 单个 API Key 的健康状态（用于多 Key 负载均衡）
+export interface ApiKeyStatus {
+  key: string; // Key 本身（用于匹配）
+  successCount: number; // 成功调用次数
+  failureCount: number; // 失败调用次数
+  cooldownUntil?: number; // 冷却截止时间，若 now < cooldownUntil 则跳过该 Key
+  lastError?: {
+    code: number;
+    message: string;
+    timestamp: number;
+  };
+}
+
 // API配置项运行时状态（用于负载均衡故障追踪）
 export interface ApiConfigRuntimeStatus {
   lastUsed?: number; // 最后使用时间戳
@@ -53,6 +66,9 @@ export interface ApiConfigRuntimeStatus {
     timestamp: number; // 发生时间
   };
   cooldownUntil?: number; // 冷却截止时间（临时禁用）
+  // ===== 多 Key 轮询支持 =====
+  keyRotationIndex?: number; // 当前轮询索引
+  keyStatuses?: Map<string, ApiKeyStatus>; // 每个 Key 的独立健康状态
 }
 
 // API配置项接口，包含配置的元数据

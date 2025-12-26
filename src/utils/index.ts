@@ -90,8 +90,22 @@ export async function testGeminiConnection(
     return { success: false, message: 'API Key is not configured.' };
   }
 
+  // 处理多 Key：取第一个非空 Key 进行测试
+  const firstKey = apiConfig.apiKey
+    .split(/[,\n\r]/)
+    .map((k) => k.trim())
+    .find((k) => k.length > 0);
+
+  if (!firstKey) {
+    return { success: false, message: 'No valid API Key found.' };
+  }
+
+  console.log(
+    `[Gemini Test] Testing with Key: ${firstKey.substring(0, 8)}... (${firstKey.length} chars)`,
+  );
+
   try {
-    const genAI = new GoogleGenerativeAI(apiConfig.apiKey);
+    const genAI = new GoogleGenerativeAI(firstKey);
 
     const baseGenerationConfig: any = {
       temperature: apiConfig.temperature,
@@ -195,6 +209,20 @@ export async function testOpenAICompatibleConnection(
     };
   }
 
+  // 处理多 Key：取第一个非空 Key 进行测试
+  const firstKey = apiConfig.apiKey
+    .split(/[,\n\r]/)
+    .map((k) => k.trim())
+    .find((k) => k.length > 0);
+
+  if (!firstKey) {
+    return { success: false, message: 'No valid API Key found.' };
+  }
+
+  console.log(
+    `[Connection Test] Testing with Key: ${firstKey.substring(0, 8)}... (${firstKey.length} chars)`,
+  );
+
   try {
     let requestBody: any = {
       model: apiConfig.model,
@@ -230,7 +258,7 @@ export async function testOpenAICompatibleConnection(
               method: 'POST',
               headers: {
                 'Content-Type': 'application/json',
-                Authorization: `Bearer ${apiConfig.apiKey}`,
+                Authorization: `Bearer ${firstKey}`,
               },
               body: JSON.stringify(requestBody),
               timeout: getApiTimeout(baseTimeout || 0) || 0,
@@ -266,7 +294,7 @@ export async function testOpenAICompatibleConnection(
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiConfig.apiKey}`,
+          Authorization: `Bearer ${firstKey}`,
         },
         body: JSON.stringify(requestBody),
       };
